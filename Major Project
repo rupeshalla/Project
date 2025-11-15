@@ -1,0 +1,153 @@
+clc; clear; close all;
+
+hazyFile = 'hazy.jpeg';
+gtFile = 'gt.png';
+
+I = im2double(imread(hazyFile));
+[h, w, ~] = size(I);
+grayI = rgb2gray(I);
+
+omega_vals = [0.9 0.95];
+t0_vals = [0.05 0.1];
+gamma_vals = [0.9 1.0];
+guided_r_vals = [40 60];
+
+bestPSNR = -inf;
+bestSSIM = -inf;
+bestImg = [];
+bestParams = struct();
+
+outputFolder = 'Dehazing_Results';
+if ~exist(outputFolder, 'dir')
+    mkdir(outputFolder);
+end
+
+imgCount = 1;
+for omega_dcp = omega_vals
+for t0 = t0_vals
+for gamma_corr = gamma_vals
+for guided_r = guided_r_vals
+
+    guided_eps = 1e-3;
+
+    se = strel('square', 15);
+    brightChannel = max(imdilate(I(:,:,1), se), max(imdilate(I(:,:,2), se), imdilate(I(:,:,3), se)));
+    darkChannel = min(imerode(I(:,:,1), se), min(imerode(I(:,:,2), se), imerode(I(:,:,3), se)));
+
+    numBright = max(1, round(0.001 * numel(brightChannel)));
+    [~, idx] = sort(brightChannel(:), 'descend');
+    A = zeros(1,3);
+    for c = 1:3
+        ch = I(:,:,c);
+        A(c) = mean(ch(idx(1:numBright)));
+    end
+
+    dark_smoothed = imguidedfilter(darkChannel, grayI, 'NeighborhoodSize', [7 7], 'DegreeOfSmoothing', 0.01);
+    t1 = 1 - omega_dcp * dark_smoothed; t1(t1<t0)=t0;
+    t2 = 1 - omega_dcp * brightChannel; t2(t2<t0)=t0;
+    t3 = (t1 + t2) / 2;
+
+    J1 = zeros(size(I)); J2 = J1; J3 = J1;
+    for c = 1:3
+        J1(:,:,c) = (I(:,:,c)-A(c))./t1 + A(c);
+        J2(:,:,c) = (I(:,:,c)-A(c))./t2 + A(c);
+        J3(:,:,c) = (I(:,:,c)-A(c))./t3 + A(c);
+    end
+    J1 = min(max(J1,0),1);
+    J2 = min(max(J2,0),1);
+    J3 = min(max(J3,0),1);
+
+    [Gx, Gy] = imgradientxy(grayI);
+    gradMag = sqrt(Gx.^2 + Gy.^2);
+    gradMag = mat2gray(gradMag);
+    depthMap = 1 - mat2gray(dark_smoothed);
+    conf1 = mat2gray(gradMag).*depthMap;
+    conf2 = mat2gray(gradMag).*(1-depthMap);
+    conf3 = 0.5*ones(h,w);
+    confSum = conf1 + conf2 + conf3 + eps;
+    conf1 = conf1./confSum; conf2 = conf2./confSum; conf3 = conf3./confSum;
+
+    Jfusion = zeros(size(I));
+    for c = 1:3
+        Jfusion(:,:,c) = conf1.*J1(:,:,c) + conf2.*J2(:,:,c) + conf3.*J3(:,:,c);
+    end
+    Jfusion = min(max(Jfusion,0),1);
+
+    for c = 1:3
+        Jfusion(:,:,c) = imguidedfilter(Jfusion(:,:,c), grayI, 'NeighborhoodSize', [guided_r guided_r], 'DegreeOfSmoothing', guided_eps);
+    end
+
+    meanRGB = squeeze(mean(mean(Jfusion,1),2));
+    gain = mean(meanRGB)./(meanRGB+eps);
+    Jw = zeros(size(Jfusion));
+    for c = 1:3
+        Jw(:,:,c) = Jfusion(:,:,c)*gain(c);
+    end
+    Jw = min(max(Jw,0),1);
+    Jout = imadjust(Jw, stretchlim(Jw,[0.01 0.99]), [], gamma_corr);
+    Jout = min(max(Jout,0),1);
+
+    if exist(gtFile,'file')
+        GT = im2double(imread(gtFile)); GT = imresize(GT,[h w]);
+        psnr_val = psnr(Jout,GT);
+        ssim_val = ssim(Jout,GT,'DynamicRange',1);
+    else
+        psnr_val = 0; ssim_val = 0;
+    end
+    niqe_val = niqe(Jout);
+
+    paramLabel = sprintf('w%.2f_t%.2f_g%.1f_r%d',omega_dcp,t0,gamma_corr,guided_r);
+
+    imwrite(I,        fullfile(outputFolder, sprintf('%03d_Input_%s.png', imgCount, paramLabel)));
+    imwrite(J1,       fullfile(outputFolder, sprintf('%03d_ELDCP_%s.png', imgCount, paramLabel)));
+    imwrite(J2,       fullfile(outputFolder, sprintf('%03d_BCP_%s.png', imgCount, paramLabel)));
+    imwrite(J3,       fullfile(outputFolder, sprintf('%03d_AVG_%s.png', imgCount, paramLabel)));
+    imwrite(conf1,    fullfile(outputFolder, sprintf('%03d_Conf1_ELDCP_%s.png', imgCount, paramLabel)));
+    imwrite(conf2,    fullfile(outputFolder, sprintf('%03d_Conf2_BCP_%s.png', imgCount, paramLabel)));
+    imwrite(conf3,    fullfile(outputFolder, sprintf('%03d_Conf3_Avg_%s.png', imgCount, paramLabel)));
+    imwrite(Jout,     fullfile(outputFolder, sprintf('%03d_FinalFused_%s.png', imgCount, paramLabel)));
+
+    fprintf('Saved set %d -> ω=%.2f, t0=%.2f, γ=%.2f, r=%d | PSNR=%.3f | SSIM=%.3f | NIQE=%.3f\n',...
+        imgCount, omega_dcp, t0, gamma_corr, guided_r, psnr_val, ssim_val, niqe_val);
+
+    figure('Name', sprintf('Set %d: ω=%.2f t0=%.2f γ=%.2f r=%d', imgCount, omega_dcp, t0, gamma_corr, guided_r), ...
+           'NumberTitle', 'off');
+    subplot(2,4,1), imshow(I), title('Input');
+    subplot(2,4,2), imshow(J1), title('ELDCP');
+    subplot(2,4,3), imshow(J2), title('BCP');
+    subplot(2,4,4), imshow(J3), title('Average');
+    subplot(2,4,5), imshow(conf1), title('Conf1');
+    subplot(2,4,6), imshow(conf2), title('Conf2');
+    subplot(2,4,7), imshow(conf3), title('Conf3');
+    subplot(2,4,8), imshow(Jout), title(sprintf('Final\nP=%.2f S=%.3f N=%.3f', psnr_val, ssim_val, niqe_val));
+    drawnow;
+
+    if psnr_val > bestPSNR && ssim_val > bestSSIM
+        bestPSNR = psnr_val;
+        bestSSIM = ssim_val;
+        bestImg = Jout;
+        bestParams.omega_dcp = omega_dcp;
+        bestParams.t0 = t0;
+        bestParams.gamma_corr = gamma_corr;
+        bestParams.guided_r = guided_r;
+        bestParams.niqe = niqe_val;
+    end
+
+    imgCount = imgCount + 1;
+
+end
+end
+end
+end
+
+figure;
+imshow(bestImg);
+title(sprintf('Best\nω=%.2f t0=%.2f γ=%.2f r=%d\nPSNR=%.2f SSIM=%.3f NIQE=%.3f',...
+    bestParams.omega_dcp, bestParams.t0, bestParams.gamma_corr, bestParams.guided_r,...
+    bestPSNR, bestSSIM, bestParams.niqe), 'FontSize', 10);
+
+imwrite(bestImg, fullfile(outputFolder, 'Best_Dehazed_ELDCP.png'));
+
+fprintf('\nAll results saved in: "%s"\n', outputFolder);
+disp(bestParams);
+fprintf('Best PSNR: %.3f | SSIM: %.3f | NIQE: %.3f\n', bestPSNR, bestSSIM, bestParams.niqe);
